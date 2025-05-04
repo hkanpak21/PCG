@@ -2,6 +2,9 @@ use ark_ff::{Fp128, Fp64, MontBackend, MontConfig, Field, PrimeField};
 use ark_ff::fields::models::fp64::Fp64Parameters;
 use ark_ff::fields::models::fp128::Fp128Parameters;
 
+// Use the galois crate for F_{2^128}
+use galois::GF2e128;
+
 // Define F_2 (useful for LPN matrix operations if not using bool/u8)
 #[derive(MontConfig)]
 #[modulus = "2"]
@@ -19,28 +22,20 @@ pub type F2 = Fp64<MontBackend<F2Config, 1>>;
 // We can represent elements as u128 and implement field arithmetic manually or use a dedicated crate.
 // Using ark-ff's Fp128 is NOT F_{2^128}. It's a prime field F_p where p fits in 128 bits.
 
-// Placeholder type for F_{2^128}. Requires a dedicated implementation or crate.
-pub type F2_128 = u128; // Very basic placeholder
+// Define F_{2^128} using the galois crate.
+// This uses the standard polynomial x^128 + x^7 + x^2 + x + 1.
+pub type Field128 = GF2e128;
 
-// Placeholder functions for F_{2^128} arithmetic (addition = XOR, multiplication = polynomial multiplication)
-// These would need actual implementation based on the chosen irreducible polynomial.
-
-pub fn add_f2_128(a: F2_128, b: F2_128) -> F2_128 {
-    a ^ b // Addition in F_{2^n} is XOR
-}
-
-pub fn mul_f2_128(a: F2_128, b: F2_128) -> F2_128 {
-    // TODO: Implement polynomial multiplication modulo x^128 + x^7 + x^2 + x + 1
-    // This requires algorithms like Russian Peasant Multiplication or hardware acceleration (PCLMULQDQ).
-    println!("Warning: F_{{2^128}} multiplication is not implemented! Returning dummy value.");
-    a.wrapping_mul(b) // Incorrect dummy placeholder
-}
+// The galois crate implements standard traits like Add, Mul, etc.
+// No need for placeholder functions add_f2_128, mul_f2_128.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ark_ff::UniformRand;
-    use rand::thread_rng;
+    use ark_ff::UniformRand as ArkUniformRand; // Use full path to avoid clash
+    use rand::{Rng, thread_rng};
+    use std::ops::{Add, Mul, Sub, Div};
+    use galois::Field;
 
     #[test]
     fn test_f2_arithmetic() {
@@ -59,25 +54,40 @@ mod tests {
     }
 
     #[test]
-    fn test_f2_128_placeholder_arithmetic() {
+    fn test_field128_arithmetic() {
         let mut rng = thread_rng();
-        let a: F2_128 = u128::rand(&mut rng);
-        let b: F2_128 = u128::rand(&mut rng);
-        let c: F2_128 = u128::rand(&mut rng);
-        let zero: F2_128 = 0;
-        let one: F2_128 = 1;
+        // Generate random elements using From<u128>
+        let a = Field128::from(rng.gen::<u128>());
+        let b = Field128::from(rng.gen::<u128>());
+        let c = Field128::from(rng.gen::<u128>());
+        let zero = Field128::ZERO;
+        let one = Field128::ONE;
 
         // Test Addition (XOR)
-        assert_eq!(add_f2_128(a, zero), a);
-        assert_eq!(add_f2_128(a, a), zero);
-        assert_eq!(add_f2_128(add_f2_128(a, b), c), add_f2_128(a, add_f2_128(b, c))); // Associativity
-        assert_eq!(add_f2_128(a, b), add_f2_128(b, a)); // Commutativity
+        assert_eq!(a.add(zero), a);
+        assert_eq!(a.add(a), zero); // a + a = 0 in GF(2^n)
+        assert_eq!(a.add(b).add(c), a.add(b.add(c))); // Associativity
+        assert_eq!(a.add(b), b.add(a)); // Commutativity
 
-        // Test Multiplication (Placeholder - only basic properties)
-        let res_mul = mul_f2_128(a, b);
-        println!("Placeholder F2_128 mul result: {}", res_mul);
-        // Cannot test correctness without actual implementation.
-        assert_eq!(mul_f2_128(a, zero), zero); // Expect 0*a = 0 (assuming placeholder mul handles 0 correctly)
-        // assert_eq!(mul_f2_128(a, one), a); // Placeholder mul won't satisfy this
+        // Test Multiplication
+        assert_eq!(a.mul(zero), zero);
+        assert_eq!(a.mul(one), a);
+        assert_eq!(a.mul(b), b.mul(a)); // Commutativity
+        assert_eq!(a.mul(b).mul(c), a.mul(b.mul(c))); // Associativity
+
+        // Test Distributivity: a * (b + c) = a * b + a * c
+        assert_eq!(a.mul(b.add(c)), a.mul(b).add(a.mul(c)));
+
+        // Test Inverse (if not zero)
+        if a != zero {
+            let a_inv = a.inverse().unwrap();
+            assert_eq!(a.mul(a_inv), one);
+        }
+         if b != zero {
+            let b_inv = b.inverse().unwrap();
+            assert_eq!(b.mul(b_inv), one);
+        }
+
+        println!("Field128 tests passed.");
     }
 }
