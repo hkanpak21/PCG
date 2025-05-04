@@ -1,0 +1,11 @@
+
+Parameters: n=8, k=4, t=2
+--- Initial State ---
+Holds reference to SvolePcg instance.
+--- Step 3: Received Delta ---
+delta = [delta_value]
+--- Step 4: Expansion Output (P0) ---
+Output Type: SvoleSenderOutput
+Content:
+  u: DVector<u8> (size 8) = [result_u_vector]
+  v: DVector<Field128> (size 8) = [result_v_vector]
