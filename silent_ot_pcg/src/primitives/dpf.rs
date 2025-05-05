@@ -1,19 +1,24 @@
 use aes::Aes128;
-use ark_ff::Field;
+use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use ark_std::marker::PhantomData;
 use ark_std::vec::Vec;
 use block_cipher::{
-    BlockCipher, NewBlockCipher,
-    generic_array::{GenericArray, typenum::U16},
+    BlockCipher,
+    generic_array::{GenericArray as BlockArray, typenum::U16 as BlockSize},
 };
 use rand::{RngCore, thread_rng};
+use crate::primitives::field::F2;
+use rand::{CryptoRng};
+use crate::pcg_core::PcgError;
+use serde::{Serialize, Deserialize};
+use std::fmt::Debug as StdDebug; // Use alias to avoid conflict if Debug derive is also used
 
 // Type alias for AES block
-type Block = GenericArray<u8, U16>;
+type Block = BlockArray<u8, BlockSize>;
 
 /// Structure for a DPF key ([GI14] construction).
 /// Contains the initial seed and correction words for each level.
-#[derive(Clone)] // Clone might be needed for seeds/outputs
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DpfKey {
     key_id: u8, // 0 or 1 (sigma)
     domain_bits: usize,
@@ -23,6 +28,7 @@ pub struct DpfKey {
     cw: Vec<Block>,
     // Final correction value (single bit for F2 DPF)
     cw_final: u8,
+    pub key_data: Vec<u8>, // Example field
 }
 
 // Added basic new method for placeholder usage if needed elsewhere
@@ -36,6 +42,7 @@ impl DpfKey {
               s0: Default::default(),
               cw: vec![],
               cw_final: 0,
+              key_data: Vec::new(),
           }
      }
 }
@@ -91,8 +98,24 @@ fn lsb(block: &Block) -> u8 {
      block[15] & 1
 }
 
+// Trait for DPF functionality
+pub trait DpfTrait {
+    type Key: Clone + StdDebug + Serialize + for<'de> Deserialize<'de>;
+    type Output: Clone + StdDebug; // Example output type
+
+    fn gen(
+        domain_bits: usize,
+        alpha: usize,
+        beta: &[u8], // Using bytes for beta consistency
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<(Self::Key, Self::Key), PcgError>;
+
+    // Add full_eval signature
+    fn full_eval(key: &Self::Key) -> Result<Vec<Self::Output>, PcgError>;
+}
+
 impl<F> Dpf<F>
-where F: From<u8> + std::ops::Add<Output = F> + Clone + Default + PartialEq + std::fmt::Debug // Traits for F2 testing
+where F: From<u8> + std::ops::Add<Output = F> + Clone + Default + PartialEq + StdDebug
 {
     /// Creates a new DPF instance.
     pub fn new(domain_bits: usize) -> Self {
@@ -192,8 +215,8 @@ where F: From<u8> + std::ops::Add<Output = F> + Clone + Default + PartialEq + st
         let cw_final_0 = final_convert1 ^ (if t[0] == 1 { beta } else { 0 });
         let cw_final_1 = final_convert0 ^ (if t[1] == 1 { beta } else { 0 });
 
-        let k0 = DpfKey { key_id: 0, domain_bits: n, s0: s_init[0], cw: cw.clone(), cw_final: cw_final_0 };
-        let k1 = DpfKey { key_id: 1, domain_bits: n, s0: s_init[1], cw: cw, cw_final: cw_final_1 };
+        let k0 = DpfKey { key_id: 0, domain_bits: n, s0: s_init[0], cw: cw.clone(), cw_final: cw_final_0, key_data: Vec::new() };
+        let k1 = DpfKey { key_id: 1, domain_bits: n, s0: s_init[1], cw: cw, cw_final: cw_final_1, key_data: Vec::new() };
 
         Ok((k0, k1))
     }
@@ -262,6 +285,45 @@ where F: From<u8> + std::ops::Add<Output = F> + Clone + Default + PartialEq + st
         }
 
         Ok(eval_vec)
+    }
+
+    // Add public getter method for domain_bits
+    pub fn domain_bits(&self) -> usize {
+        self.domain_bits
+    }
+}
+
+// Placeholder implementation of DpfTrait for Dpf
+impl<F> DpfTrait for Dpf<F>
+where
+    F: From<u8> + Clone + StdDebug + Send + Sync + 'static // Add necessary bounds for F here
+{
+    type Key = DpfKey;
+    type Output = F; // Output type is now generic F
+
+    fn gen(
+        domain_bits: usize,
+        alpha: usize,
+        beta: &[u8],
+        rng: &mut (impl RngCore + CryptoRng),
+    ) -> Result<(Self::Key, Self::Key), PcgError> {
+        // Placeholder implementation
+        println!("Warning: Using placeholder DpfTrait::gen");
+        // Create a Dpf instance temporarily to call its gen method
+        // This is awkward - ideally gen is static or DpfTrait takes &self
+        let dpf_instance = Dpf::<F>::new(domain_bits); // Need a way to instantiate Dpf<F>
+        // Assuming beta &[u8] represents a single F2 element for now
+        let beta_f2 = if beta.is_empty() || beta[0] == 0 { 0u8 } else { 1u8 };
+        dpf_instance.gen(alpha, beta_f2).map_err(|e| PcgError::DpfError(e.to_string()))
+
+    }
+
+    fn full_eval(key: &Self::Key) -> Result<Vec<Self::Output>, PcgError> {
+        // Placeholder implementation
+        println!("Warning: Using placeholder DpfTrait::full_eval for key {}", key.key_id);
+        // Create a Dpf instance temporarily to call its full_eval method
+        let dpf_instance = Dpf::<F>::new(key.domain_bits); // Assuming F allows Default or similar new()
+        dpf_instance.full_eval(key).map_err(|e| PcgError::DpfError(e.to_string()))
     }
 }
 

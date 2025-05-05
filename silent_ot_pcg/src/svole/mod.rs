@@ -1,313 +1,317 @@
-use crate::pcg_core::{PcgError, PcgExpander, PcgSeedGenerator};
-use crate::primitives::dpf::{Dpf, DpfKey};
-use crate::primitives::field::{Field128};
-use crate::primitives::lpn::{
-    LpnMatrix, LpnParameters, CodeType,
-    matrix_vector_multiply_f2, matrix_vector_multiply_fq,
-};
-use ark_ff::Field as ArkField; // Keep alias for DPF trait bounds if needed
+use crate::pcg_core::{PcgError, PcgExpander, PcgSeedGenerator, SvoleSenderSeed, SvoleReceiverSeed, SvoleSeed};
+use crate::primitives::dpf::{Dpf, DpfTrait};
+use crate::primitives::field::{Field128, F2};
+use crate::primitives::lpn::{LpnParameters};
 use ark_std::vec::Vec;
 use ark_std::marker::PhantomData;
-use rand::{Rng, thread_rng};
-use nalgebra::DVector;
-use std::ops::{Add, Mul};
-use galois::Field; // For Field128 ops
-
-// --- Seed Structures (Revised based on Fig 3 / Sec 4.3) ---
-
-// Seed for P0 (sVOLE Sender role in standard VOLE)
-#[derive(Clone)]
-pub struct SvoleSenderSeed {
-    k_dpf: DpfKey, // DPF Key K_0 for e0
-    s: DVector<u8>, // Secret k-bit vector s
-}
-
-// Seed for P1 (sVOLE Receiver role in standard VOLE)
-#[derive(Clone)]
-pub struct SvoleReceiverSeed {
-    k_dpf: DpfKey, // DPF Key K_1 for e1
-    x: DVector<Field128>, // Secret k-vector x over Field128
-}
-
-// Enum to hold either seed type
-#[derive(Clone)]
-pub enum SvoleSeed {
-    Sender(SvoleSenderSeed),
-    Receiver(SvoleReceiverSeed),
-}
+use rand::{thread_rng};
+use ark_ff::{UniformRand, One, Zero};
 
 // --- Output Structures (Revised) ---
 
 // Output for P0 (sVOLE Sender)
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct SvoleSenderOutput {
-    pub u: DVector<u8>,     // Vector u = e0 (n bits)
-    pub v: DVector<Field128>, // Vector v = Map(H*s, delta) + u*delta (n elements)
+    pub u: Vec<F2>,     // Vector u (n elements)
+    pub v: Vec<Field128>, // Vector v (n elements)
 }
 
 // Output for P1 (sVOLE Receiver)
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct SvoleReceiverOutput {
-    pub delta: Field128,      // Chosen delta value
-    pub w: DVector<Field128>, // Vector w = H*x + Map(e1, delta) (n elements)
+    pub x: Vec<F2>,    // Vector x (n elements)
+    pub w: Vec<Field128>, // Vector w (n elements)
 }
 
 // Enum to hold either output type
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum SvoleOutput {
     Sender(SvoleSenderOutput),
     Receiver(SvoleReceiverOutput),
 }
 
-
 /// sVOLE PCG struct implementing the core traits.
 /// Note: The Field F for DPF is fixed to u8 (F2 output).
 pub struct SvolePcg {
     lpn_params: LpnParameters,
-    h_matrix: LpnMatrix, // Store H (n x k) - generate once
+    dpf_handler: Dpf<F2>, // Assuming DPF output is F2, make concrete
+    _field_marker: PhantomData<Field128>, // VOLE field
 }
 
 impl SvolePcg {
-    /// Creates a new SvolePcg instance, generating the LPN matrix H.
-    /// Assumes H is n x k.
+    /// Creates a new SvolePcg instance, generating the LPN matrix.
     pub fn new(lpn_params: LpnParameters) -> Result<Self, &'static str> {
-        // Generate H (n x k)
-        // Current generator makes k x n, so we need to adjust or transpose.
-        // Let's modify the LPN parameters temporarily for generation.
-        let gen_params = LpnParameters {
-            n: lpn_params.k, // Swap n and k for generator
-            k: lpn_params.n,
-            t: lpn_params.t,
-            code_type: lpn_params.code_type, // Assume code type works with swapped dims
-        };
-        println!("Warning: Generating LPN matrix with swapped dimensions (k x n) due to generator mismatch.");
-        let h_matrix_gen = gen_params.generate_matrix()?; // Generates k x n
-
-        // TODO: Properly generate n x k matrix or transpose h_matrix_gen.
-        // For now, using the k x n matrix and assuming it's n x k conceptually.
-        let h_matrix = h_matrix_gen;
-        if h_matrix.nrows() != lpn_params.n || h_matrix.ncols() != lpn_params.k {
-             // Re-generating with correct dimensions for placeholder test
-             println!("Regenerating placeholder matrix with correct n x k dimensions.");
-             let mut rng = thread_rng();
-             match lpn_params.code_type {
-                  CodeType::RandomLinear => {
-                     let h_dense = DMatrix::from_fn(lpn_params.n, lpn_params.k, |_,_| rng.gen_range(0..=1));
-                     h_matrix = LpnMatrix::Dense(h_dense);
-                  }
-                   _ => return Err("Cannot regenerate non-random matrix with correct dims yet.")
-             }
-        }
-
-        Ok(Self { lpn_params, h_matrix })
-    }
-
-    /// Helper to map F2 vector to Field128 using delta.
-    /// output[i] = delta if input[i] == 1, else 0.
-    fn map_f2_to_fq(&self, input: &DVector<u8>, delta: Field128) -> DVector<Field128> {
-        DVector::from_iterator(
-            input.nrows(),
-            input.iter().map(|&bit| {
-                if bit == 1 { delta } else { Field128::ZERO }
-            })
-        )
+        let dpf_domain_bits = lpn_params.k; // Example: Tie DPF domain to k
+        let dpf_handler = Dpf::<F2>::new(dpf_domain_bits);
+        Ok(SvolePcg {
+            lpn_params,
+            dpf_handler,
+            _field_marker: PhantomData,
+        })
     }
 }
 
 // Implementation of the PCG Seed Generator trait for sVOLE
 // F is now fixed to u8 (DPF output for F2)
 impl PcgSeedGenerator for SvolePcg {
-    type Seed0 = SvoleSenderSeed;
-    type Seed1 = SvoleReceiverSeed;
+    type Seed = SvoleSeed;
 
-    /// sVOLE_PCG::Gen (Fig 3 / Sec 4.3)
-    /// Outputs SvoleSenderSeed and SvoleReceiverSeed.
     fn gen(
-        _security_param: usize, // Lambda (e.g., 128) - used implicitly by DPF security
-        lpn_params: &LpnParameters,
-    ) -> Result<(Self::Seed0, Self::Seed1), PcgError> {
+        &self, // Add &self back, needed for self.lpn_params, self.h_matrix etc.
+        security_param: usize, // Match the trait
+    ) -> Result<(Self::Seed, Self::Seed), PcgError> {
+        // Implementation uses self.lpn_params, self.h_matrix, self.h_transpose
+        let k = self.lpn_params.k;
+        let n = self.lpn_params.n;
 
-        let k = lpn_params.k;
-        let n = lpn_params.n;
+        // Generate H and H_transpose inside gen
+        let h_matrix = self.lpn_params.generate_matrix().map_err(|e| PcgError::LpnError(e.to_string()))?;
+        let h_transpose_matrix = h_matrix.transpose();
 
-        // 1. P1 samples random k-vector x over Field128
-        let mut rng = thread_rng();
-        let x: DVector<Field128> = DVector::from_fn(k, |_, _| Field128::from(rng.gen::<u128>()));
+        // DPF parameters: alpha = y||Delta, beta = x
+        let delta = Field128::rand(&mut thread_rng());
+        let x_f2: Vec<F2> = (0..n).map(|_| F2::rand(&mut thread_rng())).collect();
+        let y_f2: Vec<F2> = (0..k).map(|_| F2::rand(&mut thread_rng())).collect();
 
-        // 2. P0 samples random k-vector s over F_2
-        let s: DVector<u8> = DVector::from_fn(k, |_, _| rng.gen_range(0..=1));
+        // Pack alpha = y || Delta
+        let packed_y = pack_f2_vector(&y_f2)?; // Assuming this returns Result
+        let mut alpha_bytes = Vec::new();
+        alpha_bytes.extend_from_slice(&packed_y);
+        // Need robust serialization for Field128
+        alpha_bytes.extend_from_slice(&delta.to_bytes_le().map_err(|_| PcgError::SerializationError("Delta serialization failed".to_string()))?);
+        // Hash to get DPF index alpha. Using placeholder hash.
+        // Domain size `N` for DPF needs clarification. Using dpf_handler's domain_bits.
+        let alpha_idx = simple_hash_to_usize(&alpha_bytes, self.dpf_handler.domain_bits());
 
-        // 3. Parties use DPF.Gen to generate keys for the t-sparse error vector `e`.
-        //    This requires *secure* DPF generation (FR5), not local DPF gen.
-        //    The non-interactive `gen` here should produce seeds compatible with the
-        //    interactive protocol's output.
-        //    For now, create placeholder DPF keys directly.
-        //    We need the DPF output to be F2 (u8).
-        println!("Warning: Using placeholder DPF keys in sVOLE Gen. Secure generation needed.");
-        let domain_bits = (n as f64).log2().ceil() as usize;
-        let dpf = Dpf::<u8>::new(domain_bits);
-        // Choose a random alpha and beta=1 for the placeholder DPF
-        let alpha = rng.gen_range(0..n);
-        let (k_dpf0, k_dpf1) = dpf.gen(alpha, 1u8)
-            .map_err(|e| PcgError::SeedGenError(format!("DPF gen failed: {}", e)))?;
+        // Pack beta = x
+        // DPF value should be 1 bit (F2) according to Fig 3 interpretation?
+        // "Run DPF.Gen(1^lambda, alpha, beta)" where beta = x (vector)
+        // This seems to imply DPF outputs shares of x.
+        // Let's stick to the simplified F2 output DPF for now.
+        // Beta = 1. The *meaning* is tied to x implicitly.
+        let beta_f2 = 1u8; // DPF takes u8
+        println!("WARNING: Using DPF beta=1, actual value x implicitly handled.");
 
-        let seed0 = SvoleSenderSeed { k_dpf: k_dpf0, s };
-        let seed1 = SvoleReceiverSeed { k_dpf: k_dpf1, x };
+        // Generate DPF keys
+        // Use the stored dpf_handler instance
+        let (k_dpf0, k_dpf1) = self.dpf_handler.gen(alpha_idx, beta_f2).map_err(|e| PcgError::DpfError(e.to_string()))?;
 
-        Ok((seed0, seed1))
+        // Generate P0's random vector s_delta (packed F2)
+        let s_delta_f2: Vec<F2> = (0..k).map(|_| F2::rand(&mut thread_rng())).collect(); // Use k for length? Check paper
+        let s_delta_f2_sec: Vec<F2> = (0..security_param).map(|_| F2::rand(&mut thread_rng())).collect();
+        let s_delta_packed = pack_f2_vector(&s_delta_f2_sec)?; // Pack lambda bits
+
+        // Create Seeds using canonical definitions
+        let seed0 = SvoleSenderSeed {
+            k_dpf: k_dpf0,
+            s_delta: s_delta_packed, // lambda packed bits
+            y: y_f2,                 // k F2 elements
+            h_matrix: h_matrix,      // k x n matrix H
+            delta: delta,            // Field128 delta
+        };
+
+        let seed1 = SvoleReceiverSeed {
+            k_dpf: k_dpf1,
+            x: x_f2,                  // n F2 elements
+            h_transpose_matrix: h_transpose_matrix, // n x k matrix H^T
+            delta: delta,             // Field128 delta
+        };
+
+        Ok((SvoleSeed::Sender(seed0), SvoleSeed::Receiver(seed1)))
     }
 }
 
 // Implementation of the PCG Expander trait for sVOLE
 impl PcgExpander for SvolePcg {
-    type Seed = SvoleSeed; // Use the enum
-    type Output = SvoleOutput; // Use the enum
+    type Seed = SvoleSeed;
+    type Output = SvoleOutput;
 
-    /// sVOLE_PCG::Expand (Fig 3 / Sec 4.3)
-    /// Takes the combined seed enum and delta (if receiver).
+    // Add &self to match trait
     fn expand(
-        &self,
+        &self, // Add &self
         party_index: u8,
         seed: &Self::Seed,
-        // Delta is only needed by the receiver (P1)
-        delta: Option<Field128>,
     ) -> Result<Self::Output, PcgError> {
-
-        let dpf = Dpf::<u8>::new(self.lpn_params.n.ilog2() as usize);
-
         match seed {
             SvoleSeed::Sender(sender_seed) => {
-                if party_index != 0 { return Err(PcgError::ExpandError("Sender seed used by wrong party index".to_string())); }
-                let delta_val = delta.ok_or_else(|| PcgError::ExpandError("Sender requires delta value for expand".to_string()))?;
+                if party_index != 0 {
+                    return Err(PcgError::InvalidPartyIndex("Sender seed used by receiver party".to_string()));
+                }
+                // P0 (Sender) expands
+                // DPF eval -> z0
+                let z0_f2 = self.dpf_handler.full_eval(&sender_seed.k_dpf)
+                               .map_err(|e| PcgError::DpfError(e.to_string()))?;
+                // t = z0 ^ s
+                let s_f2 = unpack_f2_vector(&sender_seed.s_delta, sender_seed.h_matrix.ncols()); // Unpack s (size k)
+                let t_f2 = xor_f2_vectors(&z0_f2, &s_f2)?;
 
-                // P0 (Sender) computation
-                // 1. Get e0 = Eval(0, k_dpf0)
-                let e0_f2 = dpf.full_eval(&sender_seed.k_dpf)
-                    .map_err(|e| PcgError::ExpandError(format!("DPF eval 0 failed: {}", e)))?;
-                let u = DVector::from_vec(e0_f2);
+                // Compute v = Spread(t) + H^T * u' (where u' is derived from DPF eval? No, that's different sVOLE)
+                // From Fig 3: v = Spread(t) + y
+                let t_spread: Vec<Field128> = spread_f2_vector(&t_f2);
+                let y_spread: Vec<Field128> = spread_f2_vector(&sender_seed.y); // y is already in seed
+                let v: Vec<Field128> = add_fq_vectors(&t_spread, &y_spread);
 
-                // 2. Compute v0 = H * s (over F2)
-                let v0_f2 = matrix_vector_multiply_f2(&self.h_matrix, &sender_seed.s)?;
+                // Need u output for sender? Fig 3 output is (u,v). But u is P1's input.
+                // Let's assume P0 outputs v, P1 outputs w.
+                // Output for sender should align with v = u*delta + w relationship.
+                // P0 needs to output u. Where does P0 get u? It's from P1. This implies interaction?
+                // Re-read paper: Expand produces (u, v) for P0 and (x, w) for P1.
+                // P0 needs u. P0's seed has y=Hx, s. P0 computes t=z0^s, v=Spread(t)+y.
+                // Where does u come from? Ah, u is the DPF evaluation for P0! u = Spread(z0).
+                let u_spread: Vec<Field128> = spread_f2_vector(&z0_f2);
 
-                // 3. Map v0 and u to Field128 using delta
-                let mapped_v0 = self.map_f2_to_fq(&v0_f2, delta_val);
-                let mapped_u = self.map_f2_to_fq(&u, delta_val);
-
-                // 4. Compute v = mapped_v0 + mapped_u
-                let v = mapped_v0.add(mapped_u);
-
-                Ok(SvoleOutput::Sender(SvoleSenderOutput { u, v }))
-            }
+                Ok(SvoleOutput::Sender(SvoleSenderOutput { u: u_spread, v }))
+            },
             SvoleSeed::Receiver(receiver_seed) => {
-                if party_index != 1 { return Err(PcgError::ExpandError("Receiver seed used by wrong party index".to_string())); }
-                let delta_val = delta.ok_or_else(|| PcgError::ExpandError("Receiver requires delta value for expand".to_string()))?;
+                 if party_index != 1 {
+                    return Err(PcgError::InvalidPartyIndex("Receiver seed used by sender party".to_string()));
+                 }
+                 // Delta is now part of the seed
+                 let delta = receiver_seed.delta;
 
-                // P1 (Receiver) computation
-                // 1. Get e1 = Eval(1, k_dpf1)
-                 let e1_f2 = dpf.full_eval(&receiver_seed.k_dpf)
-                    .map_err(|e| PcgError::ExpandError(format!("DPF eval 1 failed: {}", e)))?;
-                let e1 = DVector::from_vec(e1_f2);
+                 // P1 (Receiver) expands
+                 // DPF eval -> z1
+                 let z1_f2 = self.dpf_handler.full_eval(&receiver_seed.k_dpf)
+                                .map_err(|e| PcgError::DpfError(e.to_string()))?;
 
-                // 2. Compute v1 = H * x (over Field128)
-                let v1 = matrix_vector_multiply_fq(&self.h_matrix, &receiver_seed.x)?;
+                 // Compute w = Spread(z1) - u*delta
+                 // u is already in the receiver seed.
+                 let z1_spread: Vec<Field128> = spread_f2_vector(&z1_f2);
+                 let u_delta: Vec<Field128> = receiver_seed.x.iter().map(|ui| *ui * delta).collect();
+                 let w: Vec<Field128> = sub_fq_vectors(&z1_spread, &u_delta);
 
-                // 3. Map e1 to Field128 using delta
-                let mapped_e1 = self.map_f2_to_fq(&e1, delta_val);
-
-                // 4. Compute w = v1 + mapped_e1
-                let w = v1.add(mapped_e1);
-
-                Ok(SvoleOutput::Receiver(SvoleReceiverOutput { delta: delta_val, w }))
+                 // Output is (x, w)
+                 Ok(SvoleOutput::Receiver(SvoleReceiverOutput { x: receiver_seed.x.clone(), w }))
             }
         }
     }
 }
 
+// Make helper functions public
+pub fn pack_f2_vector(v: &[F2]) -> Result<Vec<u8>, PcgError> {
+    // Implementation of pack_f2_vector
+    let num_bytes = (v.len() + 7) / 8;
+    let mut packed = vec![0u8; num_bytes];
+    for (i, f2_val) in v.iter().enumerate() {
+        if f2_val.is_one() {
+            let byte_idx = i / 8;
+            let bit_idx = i % 8;
+            packed[byte_idx] |= 1 << bit_idx;
+        }
+    }
+    Ok(packed)
+}
+
+pub fn unpack_f2_vector(v: &[u8], len: usize) -> Vec<F2> {
+    // Implementation of unpack_f2_vector
+    let mut unpacked = Vec::with_capacity(len);
+    for i in 0..len {
+        let byte_idx = i / 8;
+        let bit_idx = i % 8;
+        if byte_idx < v.len() {
+            let byte = v[byte_idx];
+            let bit = (byte >> bit_idx) & 1;
+            unpacked.push(if bit == 1 { F2::one() } else { F2::zero() });
+        } else {
+            unpacked.push(F2::zero()); // Pad with zeros if input is too short
+        }
+    }
+    unpacked
+}
+
+pub fn spread_f2_vector(v: &[F2]) -> Vec<Field128> {
+    // Implementation of spread_f2_vector (simple embedding)
+    v.iter()
+     .map(|f2| if f2.is_one() { Field128::one() } else { Field128::zero() })
+     .collect()
+}
+
+pub fn xor_f2_vectors(a: &[F2], b: &[F2]) -> Result<Vec<F2>, PcgError> {
+    // Implementation of xor_f2_vectors
+    if a.len() != b.len() {
+        return Err(PcgError::InvalidInput("Vector lengths must match for XOR".to_string()));
+    }
+    let result = a.iter().zip(b.iter()).map(|(x, y)| *x + *y).collect(); // F2 addition is XOR
+    Ok(result)
+}
+
+pub fn add_fq_vectors(a: &[Field128], b: &[Field128]) -> Vec<Field128> {
+    // Implementation of add_fq_vectors
+    a.iter().zip(b.iter()).map(|(x, y)| *x + *y).collect()
+}
+
+pub fn sub_fq_vectors(a: &[Field128], b: &[Field128]) -> Vec<Field128> {
+    // Implementation of sub_fq_vectors
+    a.iter().zip(b.iter()).map(|(x, y)| *x - *y).collect()
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::primitives::lpn::CodeType;
-    use ark_ff::Zero;
-    use galois::PrimeField; // For Field128::random
+    use crate::primitives::lpn::{LpnParameters, CodeType};
+    use rand::{rngs::StdRng, SeedableRng, RngCore};
+    use ark_ff::{Zero, Field, One};
+    use crate::primitives::field::{Field128, F2};
+    use crate::pcg_core::{SvoleSeed}; // Import moved SvoleSeed from pcg_core
 
     #[test]
     fn test_svole_gen_expand_correctness() {
-        let n = 64; // Smaller dimensions for testing
-        let k = 10;
-        let t = 3; // Ignored by placeholder DPF gen
-
+        // Setup
         let lpn_params = LpnParameters {
-            n, k, t,
+            n: 256, // Example value
+            k: 128, // Example value
+            t: 10,  // Example value
             code_type: CodeType::RandomLinear,
         };
-
-        // Create SvolePcg instance (generates H)
         let svole_pcg = SvolePcg::new(lpn_params.clone()).expect("Failed to create SVole PCG");
 
-        // Test Gen
-        let gen_result = SvolePcg::gen(128, &lpn_params);
-        assert!(gen_result.is_ok());
+        // Gen
+        let security_param = 128;
+        let gen_result = svole_pcg.gen(security_param);
+        assert!(gen_result.is_ok(), "Gen failed: {:?}", gen_result.err());
         let (seed0, seed1) = gen_result.unwrap();
 
-        // Test Expand
-        let mut rng = thread_rng();
-        let delta = Field128::random(&mut rng);
+        let delta = match &seed1 {
+            SvoleSeed::Receiver(r) => r.delta,
+            _ => panic!("Incorrect seed type for P1"),
+        };
 
-        // Wrap seeds in enum
-        let sender_seed = SvoleSeed::Sender(seed0);
-        let receiver_seed = SvoleSeed::Receiver(seed1);
-
-        let expand_res_p0 = svole_pcg.expand(0, &sender_seed, Some(delta));
-        let expand_res_p1 = svole_pcg.expand(1, &receiver_seed, Some(delta));
-
+        // Expand P0
+        let expand_res_p0 = SvolePcg::expand(0, &seed0);
         assert!(expand_res_p0.is_ok(), "P0 expand failed: {:?}", expand_res_p0.err());
+        let out0 = match expand_res_p0.unwrap() {
+            SvoleOutput::Sender(s) => s,
+            _ => panic!("Incorrect output type for P0"),
+        };
+
+        // Expand P1
+        let expand_res_p1 = SvolePcg::expand(1, &seed1);
         assert!(expand_res_p1.is_ok(), "P1 expand failed: {:?}", expand_res_p1.err());
-
-        let output0 = expand_res_p0.unwrap();
-        let output1 = expand_res_p1.unwrap();
-
-        // Extract outputs
-        let (u, v) = match output0 {
-            SvoleOutput::Sender(out) => (out.u, out.v),
-            _ => panic!("P0 expand returned wrong type"),
-        };
-        let w = match output1 {
-            SvoleOutput::Receiver(out) => {
-                assert_eq!(out.delta, delta);
-                out.w
-            }
-            _ => panic!("P1 expand returned wrong type"),
+        let out1 = match expand_res_p1.unwrap() {
+            SvoleOutput::Receiver(r) => r,
+            _ => panic!("Incorrect output type for P1"),
         };
 
-        // Check dimensions
-        assert_eq!(u.nrows(), n);
-        assert_eq!(v.nrows(), n);
-        assert_eq!(w.nrows(), n);
+        // Correctness Check: v = u * delta + w
+        // Requires converting P1's output x (packed F2) back to F2?
+        // No, the check uses u, v from P0 and w from P1.
+        assert_eq!(out0.u.len(), lpn_params.k, "P0 output u length mismatch");
+        assert_eq!(out0.v.len(), lpn_params.k, "P0 output v length mismatch");
+        assert_eq!(out1.w.len(), lpn_params.k, "P1 output w length mismatch");
 
-        // Check the core VOLE relation: v[i] = u[i]*delta + w[i]
-        let mut correctness_check_passed = true;
-        for i in 0..n {
-            let u_i = u[i];
-            let v_i = v[i];
-            let w_i = w[i];
-
-            let u_i_delta = if u_i == 1 { delta } else { Field128::ZERO };
-            let expected_v = u_i_delta.add(w_i);
-
-            if v_i != expected_v {
-                 eprintln!("Correctness check failed at index {}:", i);
-                 eprintln!("  u = {}", u_i);
-                 eprintln!("  v = {:?}", v_i);
-                 eprintln!("  w = {:?}", w_i);
-                 eprintln!("  delta = {:?}", delta);
-                 eprintln!("  u*delta+w = {:?}", expected_v);
-                 correctness_check_passed = false;
-                 // break; // Stop on first error
-            }
+        for i in 0..lpn_params.k {
+            let u_delta = out0.u[i] * delta;
+            let u_delta_plus_w = u_delta + out1.w[i];
+            assert_eq!(out0.v[i], u_delta_plus_w, "sVOLE check v = u*delta + w failed at index {}", i);
         }
 
-        assert!(correctness_check_passed, "sVOLE correctness check v = u*delta + w failed");
-        println!("sVOLE correctness check passed!");
+        println!("sVOLE correctness check passed.");
     }
+}
+
+fn simple_hash_to_usize(input: &[u8], domain_size: usize) -> usize {
+    // Placeholder implementation - use a proper hash and reduction
+    if domain_size == 0 { return 0; }
+    let hash_val = input.iter().fold(0usize, |acc, &byte| acc.wrapping_add(byte as usize));
+    hash_val % domain_size
 }

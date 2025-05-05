@@ -8,15 +8,31 @@ edition = "2021"
 [dependencies]
 rand = "0.8"
 aes = "0.8"
-block-cipher = { version = "0.9", features = ["block-padding"] }
+block-cipher = { version = "0.8" }
 # Finite field and elliptic curve libraries from arkworks
 ark-ff = { version = "0.4.0", default-features = false, features = ["parallel"] }
 ark-ec = { version = "0.4.0", default-features = false }
 ark-std = { version = "0.4.0", default-features = false }
-nalgebra = "0.32"
-nalgebra-sparse = "0.9"
+nalgebra = { version = "0.32", features = ["serde-serialize"] }
+nalgebra-sparse = { version = "0.9", features = ["serde-serialize"] }
 typenum = "1.17"
-galois = "0.7"
+# Remove macros feature, it comes from gf256-macros
+gf256 = "0.1.0" 
+# Add the separate macros crate
+gf256-macros = "0.1.0" # Match gf256 version
+oblivious_transfer_protocols = "0.11" # Check crates.io for latest version
+# Moved serde here
+serde = { version = "1.0", features = ["derive"] }
+# Add generic-array explicitly with serde feature
+generic-array = { version = "0.14", features = ["serde"] } # Check latest compatible version
 
 # Add other potential dependencies here as needed:
 # e.g., sha3 = "0.10", blake2 = "0.10", some DPF crate?, matrix library?
+
+[dev-dependencies]
+# Enable features needed by tests (e.g., specific curves)
+ark-test-curves = { version = "0.4.0", features = ["bls12_381_curve"] }
+
+[features]
+default = []
+aes_crhf = [] # Feature flag for optional AES CRHF

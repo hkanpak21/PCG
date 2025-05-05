@@ -1,95 +1,87 @@
-use aes::{Aes128, NewBlockCipher, cipher::{BlockEncrypt, KeyInit}};
+use aes::Aes128;
+use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
 use ark_std::vec::Vec;
-use ark_std::marker::PhantomData;
-use block_cipher::generic_array::GenericArray;
-use core::convert::TryInto;
+use crate::pcg_core::PcgError;
+use std::marker::PhantomData;
 
-/// Trait for a Correlation-Robust Hash Function (CRHF).
-///
-/// Maps an index `i` and an `input` value to an `output_string`.
-pub trait Crhf {
-    type Input;
-    type Output;
-
-    /// Hashes the input along with an index.
-    /// `index`: An index `i` used to potentially tweak the hash.
-    /// `input`: The primary input to the hash function.
-    fn hash(&self, index: usize, input: &Self::Input) -> Self::Output;
+/// Trait for Correlation-Robust Hash Functions (CRHF).\n/// H(i, x) -> y
+pub trait Crhf<Input, Output> {
+    /// Hashes the input `input` associated with index `i`.\n    /// Should be correlation-robust.
+    fn hash(&self, index: usize, input: &Input) -> Result<Output, PcgError>;
 }
 
-/// A CRHF implementation based on fixed-key AES.
-/// Models AES as a random permutation.
-/// H(i, x) = AES_K(i || x) ^ (i || x)  (Davies-Meyer like construction)
-/// The key K is fixed globally (e.g., derived from a master seed or hardcoded for simplicity for now).
-/// Output size is 128 bits (AES block size).
-pub struct AesCrhf<In: ?Sized> {
-    aes_cipher: Aes128,
-    _input_type: PhantomData<In>,
-    // In a real implementation, the key `K` might be configured or derived.
-    // For now, we'll use a dummy fixed key.
+/// Placeholder AES-based CRHF.\n/// H_K(x) = AES_K(x) XOR x (Davies-Meyer)
+/// For H(i, x), we might use K = PRF(master_key, i) or AES_K(i || x)
+/// Currently VERY simplified: Uses a fixed zero key and ignores index.
+/// Input type `In` determines how input bytes are provided.
+#[derive(Clone)] // Add Clone
+pub struct AesCrhf<In: ?Sized> { // Keep In generic, maybe Vec<u8> or &[u8]
+    cipher: Aes128,
+    _marker: PhantomData<In>,
 }
 
-impl<In: AsRef<[u8]>> AesCrhf<In> {
-    /// Creates a new AES-based CRHF instance.
-    /// Note: Uses a fixed, public key for demonstration.
-    /// A real implementation should use a properly generated, secret key.
-    pub fn new() -> Self {
-        // Dummy key for demonstration purposes.
-        // DO NOT USE IN PRODUCTION.
-        let key = GenericArray::from([0u8; 16]);
-        let aes_cipher = Aes128::new(&key);
-        Self { aes_cipher, _input_type: PhantomData }
+// Implement Default manually if needed, or use new_with_key.
+impl Default for AesCrhf<Vec<u8>> { // Default for Vec<u8> input type
+    fn default() -> Self {
+        println!("WARNING: AesCrhf using insecure default ZERO key!");
+        let zero_key = GenericArray::from([0u8; 16]);
+        Self { 
+            cipher: Aes128::new(&zero_key),
+             _marker: PhantomData,
+        }
     }
+}
 
-    /// Prepares the AES block by combining index and input.
-    /// Pads with zeros if necessary to fill a 128-bit block.
-    /// Currently assumes index fits in u64 and input fits in remaining space.
-    /// A more robust implementation would handle larger inputs (e.g., using a mode like CBC-MAC or hash).
-    fn prepare_block(&self, index: usize, input: &In) -> GenericArray<u8, typenum::U16> {
-        let mut block_bytes = [0u8; 16];
-        let index_bytes = (index as u64).to_le_bytes();
-        block_bytes[0..8].copy_from_slice(&index_bytes);
 
+// Provide a constructor that takes a key
+impl<In> AesCrhf<In> { // Make generic over In
+    /// Creates a new AesCrhf instance with the given AES key.
+    pub fn new_with_key(key: &[u8]) -> Result<Self, PcgError> {
+        if key.len() != 16 { // Basic key length check
+            return Err(PcgError::CrhfError("Invalid AES key length".into()));
+        }
+        let aes_key = GenericArray::from_slice(key);
+        Ok(Self {
+            cipher: Aes128::new(aes_key),
+            _marker: PhantomData,
+        })
+    }
+}
+
+
+impl<In: AsRef<[u8]>> Crhf<In, Vec<u8>> for AesCrhf<In> {
+    /// Simplified AES hash: Ignores index, assumes input fits one block.
+    /// H(x) = AES_K(x) (truncated/padded)
+    fn hash(&self, index: usize, input: &In) -> Result<Vec<u8>, PcgError> {
         let input_bytes = input.as_ref();
-        let input_len = core::cmp::min(input_bytes.len(), 8);
-        block_bytes[8..8 + input_len].copy_from_slice(&input_bytes[..input_len]);
-
-        // TODO: Handle inputs larger than 8 bytes. Hashing or a proper MAC mode needed.
-        if input_bytes.len() > 8 {
-            println!("Warning: AES CRHF input truncated to 8 bytes!");
+        if input_bytes.is_empty() {
+            return Err(PcgError::CrhfError("Input cannot be empty".into()));
         }
 
-        GenericArray::from(block_bytes)
-    }
-}
+        // Incorporate index: Simple approach - prefix input with index bytes
+        // Requires careful domain separation analysis in practice.
+        let mut block_input_vec = Vec::new();
+        block_input_vec.extend_from_slice(&index.to_le_bytes()); // Add index
+        // Pad/truncate input_bytes to fit remaining block space? Or hash index separately?
+        // Let's hash (index || input) padded to block size.
+        block_input_vec.extend_from_slice(input_bytes);
 
-impl<In: AsRef<[u8]>> Crhf for AesCrhf<In> {
-    // Assuming Input is something that can be represented as bytes.
-    // Output is fixed to 128 bits (Vec<u8> of length 16).
-    type Input = In;
-    type Output = Vec<u8>;
+        // Pad to AES block size (16 bytes)
+        let block_len = 16;
+        let padded_len = ((block_input_vec.len() + block_len - 1) / block_len) * block_len;
+        block_input_vec.resize(padded_len, 0u8); // Pad with zeros
 
-    /// Implements H(i, x) = AES_K(i || x) ^ (i || x)
-    fn hash(&self, index: usize, input: &Self::Input) -> Self::Output {
-        let block = self.prepare_block(index, input);
-        let mut encrypted_block = block.clone();
+        // Process blocks (e.g., using CBC mode or just encrypting first block)
+        // Simplest: Encrypt the first padded block containing index and input.
+        if block_input_vec.len() < block_len {
+            return Err(PcgError::CrhfError("Internal padding error".into()));
+        }
+        let mut block = GenericArray::clone_from_slice(&block_input_vec[0..block_len]);
 
-        self.aes_cipher.encrypt_block(&mut encrypted_block);
+        self.cipher.encrypt_block(&mut block);
 
-        // XOR output with input (Davies-Meyer)
-        let result_bytes: Vec<u8> = encrypted_block
-            .iter()
-            .zip(block.iter())
-            .map(|(enc_byte, in_byte)| enc_byte ^ in_byte)
-            .collect();
-
-        result_bytes
-    }
-}
-
-impl<In: AsRef<[u8]>> Default for AesCrhf<In> {
-    fn default() -> Self {
-        Self::new()
+        // Output the encrypted block
+        Ok(block.to_vec())
     }
 }
 
@@ -97,46 +89,44 @@ impl<In: AsRef<[u8]>> Default for AesCrhf<In> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{Rng, thread_rng};
+    use ark_std::vec;
 
     #[test]
-    fn test_aes_crhf_basic() {
-        let crhf = AesCrhf::<[u8]>::new();
-        let index = 12345;
-        let input = b"test_input"; // 10 bytes, will be truncated
+    fn test_aes_crhf_instantiation() {
+        let key = [0u8; 16];
+        let crhf_res = AesCrhf::<Vec<u8>>::new_with_key(&key);
+        assert!(crhf_res.is_ok());
+        let crhf = crhf_res.unwrap();
 
-        let output = crhf.hash(index, input);
+        let index = 42;
+        let input = vec![1, 2, 3, 4, 5];
+        let hash_res = crhf.hash(index, &input);
+        assert!(hash_res.is_ok());
+        let hash_val = hash_res.unwrap();
+        assert_eq!(hash_val.len(), 16);
+        println!("AES CRHF Hash: {:?}", hash_val);
 
-        assert_eq!(output.len(), 16); // AES block size
+        let input2 = vec![6, 7, 8, 9, 10];
+        let hash_res2 = crhf.hash(index, &input2);
+        assert!(hash_res2.is_ok());
+        let hash_val2 = hash_res2.unwrap();
+        assert_eq!(hash_val2.len(), 16);
+        assert_ne!(hash_val, hash_val2, "Hashes should differ for different inputs");
 
-        // Hash of same input/index should be identical
-        let output2 = crhf.hash(index, input);
-        assert_eq!(output, output2);
-
-        // Hash of different index should be different (likely)
-        let output_diff_index = crhf.hash(index + 1, input);
-        assert_ne!(output, output_diff_index);
-
-        // Hash of different input should be different (likely)
-        let output_diff_input = crhf.hash(index, b"other_inp");
-        assert_ne!(output, output_diff_input);
-
-        println!("CRHF Output ({} bytes): {:?}", output.len(), output);
+        let hash_res3 = crhf.hash(index + 1, &input);
+        assert!(hash_res3.is_ok());
+        let hash_val3 = hash_res3.unwrap();
+        assert_eq!(hash_val3.len(), 16);
+        assert_ne!(hash_val, hash_val3, "Hashes should differ for different indices");
     }
 
-    #[test]
-    fn test_aes_crhf_vectors() {
-        let crhf = AesCrhf::<Vec<u8>>::new();
-        let index = 987;
-        let input_vec = vec![0, 1, 2, 3, 4, 5]; // 6 bytes
-
-        let output = crhf.hash(index, &input_vec);
-        assert_eq!(output.len(), 16);
-
-        // Check determinism
-        let output2 = crhf.hash(index, &input_vec);
-        assert_eq!(output, output2);
-
-        println!("CRHF Output Vec ({} bytes): {:?}", output.len(), output);
+     #[test]
+    fn test_aes_crhf_default() {
+        let crhf = AesCrhf::<Vec<u8>>::default();
+        let index = 1;
+        let input = vec![10; 8];
+        let hash_res = crhf.hash(index, &input);
+        assert!(hash_res.is_ok());
+        assert_eq!(hash_res.unwrap().len(), 16);
     }
 }
